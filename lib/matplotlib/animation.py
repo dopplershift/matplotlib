@@ -591,7 +591,8 @@ class TimedAnimation(Animation):
                 self.event_source.add_callback(self._loop_delay)
                 self.event_source.interval = self._repeat_delay
             self.frame_seq = self.new_frame_seq()
-            return True
+            # Try drawing again, but now at the beginning of the sequence
+            return Animation._step(self, *args)
         else:
             return still_going
 
