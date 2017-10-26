@@ -36,6 +36,7 @@ except ImportError:
     from base64 import encodestring as encodebytes
 import abc
 import contextlib
+import functools
 import tempfile
 import uuid
 import warnings
@@ -1044,7 +1045,9 @@ class Animation(object):
         # Disables blitting for backends that don't support it.  This
         # allows users to request it if available, but still have a
         # fallback that works if it is not.
-        self._blit = blit and fig.canvas.supports_blit
+        self._turn_on_blit = blit and fig.canvas.supports_blit
+        self._blit = False
+        print('Init. Blit:', self._turn_on_blit)
 
         # These are the basics of the animation.  The frame sequence represents
         # information for each frame of the animation and depends on how the
@@ -1061,8 +1064,6 @@ class Animation(object):
         # fire events and try to draw to a deleted figure.
         self._close_id = self._fig.canvas.mpl_connect('close_event',
                                                       self._stop)
-        if self._blit:
-            self._setup_blit()
 
     def _start(self, *args):
         '''
@@ -1074,7 +1075,8 @@ class Animation(object):
         self._first_draw_id = None  # So we can check on save
 
         # Now do any initial draw
-        self._init_draw()
+        self._need_init = True
+        self._can_blit = True
 
         # Add our callback for stepping the animation and
         # actually start the event_source.
@@ -1285,14 +1287,31 @@ class Animation(object):
     def _draw_next_frame(self, framedata, blit):
         # Breaks down the drawing of the next frame into steps of pre- and
         # post- draw, as well as the drawing of the frame itself.
-        self._pre_draw(framedata, blit)
-        self._draw_frame(framedata)
-        self._post_draw(framedata, blit)
+        # print('drawing frame')
+        if self._need_init:
+            # print('Need init frame.')
+            self._init_draw(self._turn_on_blit or blit)
 
-    def _init_draw(self):
+        if self._turn_on_blit:
+            # print('Enabling blit code')
+            self._blit_draw_id = self._fig.canvas.mpl_connect('draw_event',
+                                                              functools.partial(self._enable_blit_after_draw, framedata))
+            self._cached_framedata = framedata
+            self._fig.canvas.draw_idle()
+            return
+
+        # print('pre_draw')
+        self._pre_draw(framedata, blit)
+        # print('draw_frame')
+        self._draw_frame(framedata)
+        # print('post_draw')
+        self._post_draw(framedata, blit)
+        # print('done')
+
+    def _init_draw(self, blit):
         # Initial draw to clear the frame. Also used by the blitting code
         # when a clean base is required.
-        pass
+        self._need_init = False
 
     def _pre_draw(self, framedata, blit):
         # Perform any cleaning or whatnot before the drawing of the frame.
@@ -1315,6 +1334,14 @@ class Animation(object):
             self._fig.canvas.draw_idle()
 
     # The rest of the code in this class is to facilitate easy blitting
+    def _enable_blit_after_draw(self, cached_framedata, evt):
+        print('drawing after clearing blit')
+        self._fig.canvas.mpl_disconnect(self._blit_draw_id)
+        self._setup_blit()
+        self._can_blit = False
+        self._draw_next_frame(cached_framedata, True)
+        self._can_blit = True
+
     def _blit_draw(self, artists, bg_cache):
         # Handles blitted drawing, which renders only the artists given instead
         # of the entire figure.
@@ -1329,8 +1356,9 @@ class Animation(object):
             updated_ax.append(a.axes)
 
         # After rendering all the needed artists, blit each axes individually.
-        for ax in set(updated_ax):
-            ax.figure.canvas.blit(ax.bbox)
+        if self._can_blit:
+            for ax in set(updated_ax):
+                ax.figure.canvas.blit(ax.bbox)
 
     def _blit_clear(self, artists, bg_cache):
         # Get a list of the axes that need clearing from the artists that
@@ -1348,7 +1376,8 @@ class Animation(object):
         self._drawn_artists = []
         self._resize_id = self._fig.canvas.mpl_connect('resize_event',
                                                        self._handle_resize)
-        self._post_draw(None, self._blit)
+        self._turn_on_blit = False
+        self._blit = True
 
     def _handle_resize(self, *args):
         # On resize, we need to disable the resize event handling so we don't
@@ -1356,20 +1385,13 @@ class Animation(object):
         # we're paused. Reset the cache and re-init. Set up an event handler
         # to catch once the draw has actually taken place.
         self._fig.canvas.mpl_disconnect(self._resize_id)
-        self.event_source.stop()
-        self._blit_cache.clear()
-        self._init_draw()
-        self._resize_id = self._fig.canvas.mpl_connect('draw_event',
-                                                       self._end_redraw)
-
-    def _end_redraw(self, evt):
-        # Now that the redraw has happened, do the post draw flushing and
-        # blit handling. Then re-enable all of the original events.
-        self._post_draw(None, False)
-        self.event_source.start()
-        self._fig.canvas.mpl_disconnect(self._resize_id)
-        self._resize_id = self._fig.canvas.mpl_connect('resize_event',
-                                                       self._handle_resize)
+        print('handling resize for blit')
+        # self._blit_cache.clear()
+        for a in self._drawn_artists:
+            a.set_animated(False)
+        self._turn_on_blit = True
+        self._blit = False
+        self._need_init = True
 
     def to_html5_video(self, embed_limit=None):
         '''Returns animation as an HTML5 video tag.
@@ -1534,7 +1556,7 @@ class TimedAnimation(Animation):
         # back.
         still_going = Animation._step(self, *args)
         if not still_going and self.repeat:
-            self._init_draw()
+            self._need_init = True
             self.frame_seq = self.new_frame_seq()
             if self._repeat_delay:
                 self.event_source.remove_callback(self._step)
@@ -1603,13 +1625,13 @@ class ArtistAnimation(TimedAnimation):
         self._framedata = artists
         TimedAnimation.__init__(self, fig, *args, **kwargs)
 
-    def _init_draw(self):
+    def _init_draw(self, blit):
         # Make all the artists involved in *any* frame invisible
         figs = set()
         for f in self.new_frame_seq():
             for artist in f:
                 artist.set_visible(False)
-                artist.set_animated(self._blit)
+                artist.set_animated(blit)
                 # Assemble a list of unique figures that need flushing
                 if artist.get_figure() not in figs:
                     figs.add(artist.get_figure())
@@ -1617,6 +1639,8 @@ class ArtistAnimation(TimedAnimation):
         # Flush the needed figures
         for fig in figs:
             fig.canvas.draw_idle()
+
+        super(ArtistAnimation, self)._init_draw(blit)
 
     def _pre_draw(self, framedata, blit):
         '''
@@ -1776,23 +1800,24 @@ class FuncAnimation(TimedAnimation):
         else:
             return itertools.islice(self.new_frame_seq(), self.save_count)
 
-    def _init_draw(self):
+    def _init_draw(self, blit):
         # Initialize the drawing either using the given init_func or by
         # calling the draw function with the first item of the frame sequence.
         # For blitting, the init_func should return a sequence of modified
         # artists.
         if self._init_func is None:
             self._draw_frame(next(self.new_frame_seq()))
-
         else:
             self._drawn_artists = self._init_func()
-            if self._blit:
+            if blit:
                 if self._drawn_artists is None:
                     raise RuntimeError('The init_func must return a '
                                        'sequence of Artist objects.')
                 for a in self._drawn_artists:
-                    a.set_animated(self._blit)
+                    a.set_animated(True)
         self._save_seq = []
+
+        super(FuncAnimation, self)._init_draw(blit)
 
     def _draw_frame(self, framedata):
         # Save the data for potential saving of movies.
@@ -1810,4 +1835,4 @@ class FuncAnimation(TimedAnimation):
                 raise RuntimeError('The animation function must return a '
                                    'sequence of Artist objects.')
             for a in self._drawn_artists:
-                a.set_animated(self._blit)
+                a.set_animated(True)
