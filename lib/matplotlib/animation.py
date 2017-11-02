@@ -1010,6 +1010,264 @@ class HTMLWriter(FileMovieWriter):
                                              **mode_dict))
 
 
+class Animator(object):
+    def _init_draw(self, blit):
+        # Initial draw to clear the frame. Also used by the blitting code
+        # when a clean base is required.
+        self._need_init = False
+
+    def _pre_draw(self, framedata, blit):
+        # Perform any cleaning or whatnot before the drawing of the frame.
+        # This default implementation allows blit to clear the frame.
+        if blit:
+            self._blit_clear(self._drawn_artists, self._blit_cache)
+
+    def _draw_frame(self, framedata):
+        # Performs actual drawing of the frame.
+        raise NotImplementedError('Needs to be implemented by subclasses to'
+                                  ' actually make an animation.')
+
+    def _post_draw(self, framedata, blit):
+        self._fig.canvas.draw_idle()
+
+    ### ARTISTANIMATION ###
+    def _init_draw(self, blit):
+        # Make all the artists involved in *any* frame invisible
+        figs = set()
+        for f in self.new_frame_seq():
+            for artist in f:
+                artist.set_visible(False)
+                artist.set_animated(blit)
+                # Assemble a list of unique figures that need flushing
+                if artist.get_figure() not in figs:
+                    figs.add(artist.get_figure())
+
+        # Flush the needed figures
+        for fig in figs:
+            fig.canvas.draw_idle()
+
+        super(ArtistAnimation, self)._init_draw(blit)
+
+    def _pre_draw(self, framedata, blit):
+        '''
+        Clears artists from the last frame.
+        '''
+        if blit:
+            # Let blit handle clearing
+            self._blit_clear(self._drawn_artists, self._blit_cache)
+        else:
+            # Otherwise, make all the artists from the previous frame invisible
+            for artist in self._drawn_artists:
+                artist.set_visible(False)
+
+    def _draw_frame(self, artists):
+        # Save the artists that were passed in as framedata for the other
+        # steps (esp. blitting) to use.
+        self._drawn_artists = artists
+
+        # Make all the artists from the current frame visible
+        for artist in artists:
+            artist.set_visible(True)
+
+    ### FUNCANIMATION ###
+    def _init_draw(self, blit):
+        # Initialize the drawing either using the given init_func or by
+        # calling the draw function with the first item of the frame sequence.
+        # For blitting, the init_func should return a sequence of modified
+        # artists.
+        if self._init_func is None:
+            self._draw_frame(next(self.new_frame_seq()))
+        else:
+            self._drawn_artists = self._init_func()
+            if blit:
+                if self._drawn_artists is None:
+                    raise RuntimeError('The init_func must return a '
+                                       'sequence of Artist objects.')
+                for a in self._drawn_artists:
+                    a.set_animated(True)
+        self._save_seq = []
+
+        super(FuncAnimation, self)._init_draw(blit)
+
+    def _draw_frame(self, framedata):
+        # Save the data for potential saving of movies.
+        self._save_seq.append(framedata)
+
+        # Make sure to respect save_count (keep only the last save_count
+        # around)
+        self._save_seq = self._save_seq[-self.save_count:]
+
+        # Call the func with framedata and args. If blitting is desired,
+        # func needs to return a sequence of any artists that were modified.
+        self._drawn_artists = self._func(framedata, *self._args)
+        if self._blit:
+            if self._drawn_artists is None:
+                raise RuntimeError('The animation function must return a '
+                                   'sequence of Artist objects.')
+            for a in self._drawn_artists:
+                a.set_animated(True)
+
+
+class BlitAnimator(object):
+    def _init_draw(self, blit):
+        # Initial draw to clear the frame. Also used by the blitting code
+        # when a clean base is required.
+        self._need_init = False
+
+    def _pre_draw(self, framedata, blit):
+        # Perform any cleaning or whatnot before the drawing of the frame.
+        # This default implementation allows blit to clear the frame.
+        self._blit_clear(self._drawn_artists, self._blit_cache)
+
+    def _draw_frame(self, framedata):
+        # Performs actual drawing of the frame.
+        raise NotImplementedError('Needs to be implemented by subclasses to'
+                                  ' actually make an animation.')
+
+    def _post_draw(self, framedata, blit):
+        # After the frame is rendered, this handles the actual flushing of
+        # the draw, which can be a direct draw_idle() or make use of the
+        # blitting.
+        self._blit_draw(self._drawn_artists, self._blit_cache)
+
+    # The rest of the code in this class is to facilitate easy blitting
+    def _enable_blit_after_draw(self, cached_framedata, evt):
+        print('drawing after clearing blit')
+        self._fig.canvas.mpl_disconnect(self._blit_draw_id)
+        self._setup_blit()
+        self._can_blit = False
+        self._draw_next_frame(cached_framedata, True)
+        self._can_blit = True
+
+    def _blit_draw(self, artists, bg_cache):
+        # Handles blitted drawing, which renders only the artists given instead
+        # of the entire figure.
+        updated_ax = []
+        for a in artists:
+            # If we haven't cached the background for this axes object, do
+            # so now. This might not always be reliable, but it's an attempt
+            # to automate the process.
+            if a.axes not in bg_cache:
+                bg_cache[a.axes] = a.figure.canvas.copy_from_bbox(a.axes.bbox)
+            a.axes.draw_artist(a)
+            updated_ax.append(a.axes)
+
+        # After rendering all the needed artists, blit each axes individually.
+        if self._can_blit:
+            for ax in set(updated_ax):
+                ax.figure.canvas.blit(ax.bbox)
+
+    def _blit_clear(self, artists, bg_cache):
+        # Get a list of the axes that need clearing from the artists that
+        # have been drawn. Grab the appropriate saved background from the
+        # cache and restore.
+        axes = set(a.axes for a in artists)
+        for a in axes:
+            if a in bg_cache:
+                a.figure.canvas.restore_region(bg_cache[a])
+
+    def _setup_blit(self):
+        # Setting up the blit requires: a cache of the background for the
+        # axes
+        self._blit_cache = dict()
+        self._drawn_artists = []
+        self._resize_id = self._fig.canvas.mpl_connect('resize_event',
+                                                       self._handle_resize)
+        self._turn_on_blit = False
+        self._blit = True
+
+    def _handle_resize(self, *args):
+        # On resize, we need to disable the resize event handling so we don't
+        # get too many events. Also stop the animation events, so that
+        # we're paused. Reset the cache and re-init. Set up an event handler
+        # to catch once the draw has actually taken place.
+        self._fig.canvas.mpl_disconnect(self._resize_id)
+        print('handling resize for blit')
+        # self._blit_cache.clear()
+        for a in self._drawn_artists:
+            a.set_animated(False)
+        self._turn_on_blit = True
+        self._blit = False
+        self._need_init = True
+
+    ### ARTISTANIMATION ###
+    def _init_draw(self, blit):
+        # Make all the artists involved in *any* frame invisible
+        figs = set()
+        for f in self.new_frame_seq():
+            for artist in f:
+                artist.set_visible(False)
+                artist.set_animated(blit)
+                # Assemble a list of unique figures that need flushing
+                if artist.get_figure() not in figs:
+                    figs.add(artist.get_figure())
+
+        # Flush the needed figures
+        for fig in figs:
+            fig.canvas.draw_idle()
+
+        super(ArtistAnimation, self)._init_draw(blit)
+
+    def _pre_draw(self, framedata, blit):
+        '''
+        Clears artists from the last frame.
+        '''
+        if blit:
+            # Let blit handle clearing
+            self._blit_clear(self._drawn_artists, self._blit_cache)
+        else:
+            # Otherwise, make all the artists from the previous frame invisible
+            for artist in self._drawn_artists:
+                artist.set_visible(False)
+
+    def _draw_frame(self, artists):
+        # Save the artists that were passed in as framedata for the other
+        # steps (esp. blitting) to use.
+        self._drawn_artists = artists
+
+        # Make all the artists from the current frame visible
+        for artist in artists:
+            artist.set_visible(True)
+
+    ### FUNCANIMATION ###
+    def _init_draw(self, blit):
+        # Initialize the drawing either using the given init_func or by
+        # calling the draw function with the first item of the frame sequence.
+        # For blitting, the init_func should return a sequence of modified
+        # artists.
+        if self._init_func is None:
+            self._draw_frame(next(self.new_frame_seq()))
+        else:
+            self._drawn_artists = self._init_func()
+            if blit:
+                if self._drawn_artists is None:
+                    raise RuntimeError('The init_func must return a '
+                                       'sequence of Artist objects.')
+                for a in self._drawn_artists:
+                    a.set_animated(True)
+        self._save_seq = []
+
+        super(FuncAnimation, self)._init_draw(blit)
+
+    def _draw_frame(self, framedata):
+        # Save the data for potential saving of movies.
+        self._save_seq.append(framedata)
+
+        # Make sure to respect save_count (keep only the last save_count
+        # around)
+        self._save_seq = self._save_seq[-self.save_count:]
+
+        # Call the func with framedata and args. If blitting is desired,
+        # func needs to return a sequence of any artists that were modified.
+        self._drawn_artists = self._func(framedata, *self._args)
+        if self._blit:
+            if self._drawn_artists is None:
+                raise RuntimeError('The animation function must return a '
+                                   'sequence of Artist objects.')
+            for a in self._drawn_artists:
+                a.set_animated(True)
+
+
 class Animation(object):
     '''This class wraps the creation of an animation using matplotlib.
 
